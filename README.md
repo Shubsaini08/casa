@@ -3,6 +3,15 @@ ALL CASACIOUS BITS (22,23,26,30) ARE INCLUDED WITH RIPMD160 GENERATOR
 
 ---
 
+## 📚 **Resources**
+
+- **Community & Discussions:**  
+  - [TeamHunter GUI](https://t.me/TeamHunter_GUI/566)  
+  - [Crypto Base Discussion](https://t.me/Crypto_Base_Discuss)  
+  - [Code Crusaders](https://t.me/code_Crusaders0/2)  
+
+---
+
 # Possibility:
 
 
