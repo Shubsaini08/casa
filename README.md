@@ -119,7 +119,7 @@ Clone the repository and compile the program with your preferred C++ compiler:
 
 ```bash
 git clone https://github.com/Shubsaini08/casa.git
-cd casascius-mini-key-generator
+cd casa 
 sudo apt-get install libssl-dev  # Ubuntu/Debian users
 g++ -o casa main.cpp -std=c++11 -pthread -lssl -lcrypto
 ```
