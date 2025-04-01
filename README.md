@@ -2,8 +2,9 @@
 ALL CASACIOUS BITS (22,23,26,30) ARE INCLUDED WITH RIPMD160 GENERATOR
 
 ---
-#EDITS
-I re wrote code for few stuff guys reported bugs in -S command and its working so yeahh now its fine and accurate for stuff to make moves and generate valid stuf 
+# EDITS
+
+I rewrote code for few stuff guys reported bugs in -S command and its working so yeahh now its fine and accurate for stuff to make moves and generate valid stuf 
 also its speed is also increased 30% from last ones :D 
 
 [OLD SCRIPT OF CASA WITH BUGS REPORTED](https://t.me/privatekeydirectory/1445)
