@@ -37,34 +37,47 @@ using namespace std;
 using namespace std::chrono;
 
 //------------------------------------------------------------------------------
-// Global configuration and state
+// Global Configuration and State
 //------------------------------------------------------------------------------
-const long long LOG_INTERVAL = 1000000000LL; // checkpoint every 1e9 keys
+const long long LOG_INTERVAL = 1000LL; // Checkpoint every 1e9 keys
 atomic<long long> keyCounter(0);
 atomic<long long> matchCounter(0);
-atomic<long long> validKeyCounter(0);    // Added: Counter for valid keys
-atomic<long long> invalidKeyCounter(0);  // Added: Counter for invalid keys
+atomic<long long> validKeyCounter(0);    // Counter for valid keys
+atomic<long long> invalidKeyCounter(0);  // Counter for invalid keys
 mutex fileMutex;
 
 int miniKeyLength = 22;      // Allowed mini key lengths: 22, 23, 26, 30
-int printInterval = 0;       // seconds between performance prints
-int numThreads = 1;          // default number of worker threads
-bool sequenceMode = false;   // resume mode enabled
-bool loggingMode = false;    // logging checkpoint mode enabled
-bool multiMode = false;      // multi mini key lengths mode enabled
-string targetFile = "";      // optional file of target RIPEMD160 hashes
-unordered_set<string> targetHashes; // Changed to unordered_set for O(1) lookup
+int printInterval = 0;       // Seconds between performance prints
+int numThreads = 1;          // Default number of worker threads
+bool sequenceMode = false;   // Sequential mode enabled
+bool loggingMode = false;    // Logging checkpoint mode enabled
+bool multiMode = false;      // Multi mini key lengths mode enabled
+string targetFile = "";      // Optional file of target RIPEMD160 hashes
+unordered_set<string> targetHashes; // O(1) lookup for target hashes
 
-// For resume mode using a base key
+// For sequential mode using a base key
 string baseMiniKey = "";
-atomic<long long> globalIndex(0);
 
-ofstream savedFile;          // log of all generated keys (saved.txt)
-ofstream foundFile;          // log of matching keys (casascius_found.txt)
-ofstream sequenceLogFile;    // log for saving the last key (for resume)
+// Files
+ofstream savedFile;          // Log of all generated keys (saved.txt)
+ofstream foundFile;          // Log of matching keys (casascius_found.txt)
+ofstream sequenceLogFile;    // Log for saving the last key (for resume)
 
 steady_clock::time_point startTime;
-atomic<bool> shutdownFlag(false);  // used to signal graceful termination
+atomic<bool> shutdownFlag(false);  // Signal for graceful termination
+
+// Character set for key generation
+const string charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+vector<int> char_to_index(256, -1);
+
+// Initialize char_to_index
+struct CharToIndexInitializer {
+    CharToIndexInitializer() {
+        for (int i = 0; i < charset.size(); i++) {
+            char_to_index[static_cast<unsigned char>(charset[i])] = i;
+        }
+    }
+} char_to_index_initializer;
 
 // -------------------- Bloom Filter Implementation ----------------------
 const size_t BLOOM_SIZE = 1000000000;  // e.g., 1e9 bits (~125MB)
@@ -72,8 +85,8 @@ const size_t BLOOM_HASHES = 7;         // Number of hash functions
 
 class BloomFilter {
     vector<uint32_t> bit_array;
-    size_t m; // total number of bits
-    size_t k; // number of hash functions
+    size_t m; // Total number of bits
+    size_t k; // Number of hash functions
 
     inline void set_bit(size_t pos) {
         bit_array[pos >> 5] |= (1u << (pos & 31));
@@ -117,16 +130,15 @@ string derivePrivateKey(const string &miniKey);
 vector<unsigned char> derivePublicKey(EC_KEY* ecKey, const string &privateKeyHex, bool compressed);
 string computeRipemdFromPubKey(const vector<unsigned char> &pubKey);
 string randomMiniKey(int length, mt19937& gen);
-string generateSequentialMiniKey();
+string nextMiniKey(const string& current);
 void loadTargetHashes(const string &filename);
 void printHelp();
 bool isValidMiniKey(const string &miniKey);
 string generateBTCAddress(const vector<unsigned char>& pubKey);
 string Base58Encode(const vector<unsigned char>& input);
 int randomAllowedLength(mt19937& gen);
-long long extractIndexFromKey(const string &key);
 void processDerive(const string &casakey);
-void generationThread();
+void generationThread(string startKey);
 string readLastNonEmptyLine(const string &filename);
 void signalHandler(int signum);
 
@@ -137,7 +149,7 @@ void printHelp() {
     cout << "[X]Usage: ./casa [options]\n\n";
     cout << "-h / -help      : Display this help guide.\n  Shows each argument with exactly two lines of explanation.\n";
     cout << "-p / -print N   : Set print interval to N seconds.\n  Determines how frequently performance is printed to the console.\n";
-    cout << "-S / -seq [key] : Enable sequence (resume) mode.\n  If a mini key is provided after -S, its numeric part is extracted and generation resumes sequentially. Otherwise, the last key from sequence_log.txt is used.\n";
+    cout << "-S / -seq [key] : Enable sequence mode with optional starting key.\n  Generates all combinations sequentially from the given key or last logged key.\n";
     cout << "-t / -core N    : Set number of worker threads to N.\n  Specifies the number of CPU cores for parallel key generation.\n";
     cout << "-b / -bit N     : Set mini key length to N (allowed: 22, 23, 26, 30).\n  Customizes the mini key length; invalid values trigger this guide.\n";
     cout << "-f / -file F    : Use target file F of RIPEMD160 hashes for matching.\n  Generated key hashes are compared against those in F; matches are logged in casascius_found.txt.\n";
@@ -234,28 +246,29 @@ string randomMiniKey(int length, mt19937& gen) {
     return key;
 }
 
-// **generateSequentialMiniKey**: Generate a sequential mini key.
-string generateSequentialMiniKey() {
-    long long index = globalIndex.fetch_add(1);
-    ostringstream oss;
-    oss << setw(miniKeyLength - 1) << setfill('0') << index;
-    return "S" + oss.str();
-}
-
-// **extractIndexFromKey**: Extract the numeric portion from a mini key.
-long long extractIndexFromKey(const string &key) {
-    string numStr;
-    for (size_t i = 1; i < key.size(); i++) {
-        if (isdigit(key[i]))
-            numStr.push_back(key[i]);
+// **nextMiniKey**: Generate the next sequential mini key from the current one.
+string nextMiniKey(const string& current) {
+    if (current.empty() || current[0] != 'S') {
+        throw runtime_error("Invalid mini key");
     }
-    if (numStr.empty())
-        return 0;
-    try {
-        return stoll(numStr);
-    } catch (...) {
-        return 0;
+    string key = current.substr(1);
+    int len = key.length();
+    for (int i = len - 1; i >= 0; i--) {
+        char c = key[i];
+        int idx = char_to_index[static_cast<unsigned char>(c)];
+        if (idx == -1) {
+            throw runtime_error("Invalid character in mini key");
+        }
+        if (idx < 61) { // 61 is the index of '9'
+            key[i] = charset[idx + 1];
+            return "S" + key;
+        } else {
+            key[i] = charset[0]; // Reset to 'A'
+            // Carry over to the next position
+        }
     }
+    // All characters were '9', keyspace exhausted (unlikely for large lengths)
+    throw runtime_error("Reached end of keyspace");
 }
 
 // **derivePrivateKey**: Derive a full 256-bit private key from the mini key using SHA-256.
@@ -340,11 +353,9 @@ void loadTargetHashes(const string &filename) {
     }
     string line;
     while (getline(infile, line)) {
-        // Trim whitespace
         line.erase(0, line.find_first_not_of(" \t\r\n"));
         line.erase(line.find_last_not_of(" \t\r\n") + 1);
         if (!line.empty()) {
-            // Basic validation: ensure it's a 40-char hex string (RIPEMD160 length in hex)
             if (line.length() == 40 && all_of(line.begin(), line.end(), ::isxdigit)) {
                 targetHashes.insert(line);
                 if (targetBloom)
@@ -424,7 +435,7 @@ void processDerive(const string& casakey) {
         cout << "Error: Failed to create EC_KEY\n";
         return;
     }
-    
+
     cout << string(60, '-') << "\n";
     vector<unsigned char> pubKeyCompressed = derivePublicKey(ecKey, privKeyHex, true);
     vector<unsigned char> pubKeyUncompressed = derivePublicKey(ecKey, privKeyHex, false);
@@ -470,7 +481,7 @@ string readLastNonEmptyLine(const string &filename) {
 }
 
 // **generationThread**: Worker thread for generating and validating mini keys.
-void generationThread() {
+void generationThread(string startKey) {
     try {
         mt19937 gen(random_device{}());
         EC_KEY* ecKey = EC_KEY_new_by_curve_name(NID_secp256k1);
@@ -479,31 +490,34 @@ void generationThread() {
             return;
         }
         thread_local vector<string> localBuffer;
+        string currentKey = startKey;
+        long long localKeyCount = 0;
         while (!shutdownFlag.load()) {
             string miniKey;
-            if (sequenceMode) {
-                miniKey = generateSequentialMiniKey();
+            if (sequenceMode && !currentKey.empty()) {
+                miniKey = currentKey;
+                currentKey = nextMiniKey(currentKey);
             } else {
                 int currentLength = multiMode ? randomAllowedLength(gen) : miniKeyLength;
                 miniKey = randomMiniKey(currentLength, gen);
             }
-            
+
             keyCounter++;
             if (!isValidMiniKey(miniKey)) {
-                invalidKeyCounter++; // Added: Increment invalid counter
+                invalidKeyCounter++;
                 continue;
             }
-            validKeyCounter++; // Added: Increment valid counter
-            
+            validKeyCounter++;
+
             string privKeyHex = derivePrivateKey(miniKey);
             vector<unsigned char> pubKeyCompressed = derivePublicKey(ecKey, privKeyHex, true);
             vector<unsigned char> pubKeyUncompressed = derivePublicKey(ecKey, privKeyHex, false);
             string ripemdCompressed = computeRipemdFromPubKey(pubKeyCompressed);
             string ripemdUncompressed = computeRipemdFromPubKey(pubKeyUncompressed);
-            
+
             string outBlock = miniKey + " " + privKeyHex + " " + ripemdCompressed + " " + ripemdUncompressed + "\n";
             localBuffer.push_back(outBlock);
-            
+
             if (localBuffer.size() >= 1000) {
                 lock_guard<mutex> lock(fileMutex);
                 for (const auto& str : localBuffer) {
@@ -514,7 +528,7 @@ void generationThread() {
                 }
                 localBuffer.clear();
             }
-            
+
             if (!targetHashes.empty() && 
                 (targetBloom->possibly_contains(ripemdCompressed) || targetBloom->possibly_contains(ripemdUncompressed))) {
                 if (targetHashes.count(ripemdCompressed) || targetHashes.count(ripemdUncompressed)) {
@@ -534,8 +548,9 @@ void generationThread() {
                     cout << "[-]Keys per second: " << keysPerSec << "\n";
                 }
             }
-            
-            if (loggingMode && (keyCounter.load() % LOG_INTERVAL == 0)) {
+
+            localKeyCount++;
+            if (loggingMode && sequenceMode && localKeyCount % LOG_INTERVAL == 0) {
                 lock_guard<mutex> lock(fileMutex);
                 sequenceLogFile << miniKey << "\n";
                 sequenceLogFile.flush();
@@ -569,14 +584,14 @@ void signalHandler(int signum) {
 // **main**: Parse command-line arguments and launch worker threads.
 int main(int argc, char* argv[]) {
     signal(SIGINT, signalHandler);
-    
+
     if (argc == 1) {
         printHelp();
         return 0;
     }
-    
+
     startTime = steady_clock::now();
-    
+
     for (int i = 1; i < argc; i++) {
         string arg = argv[i];
         try {
@@ -593,26 +608,10 @@ int main(int argc, char* argv[]) {
             } else if (arg == "-S" || arg == "-seq") {
                 sequenceMode = true;
                 if (i + 1 < argc) {
-                    string possibleKey = argv[i+1];
+                    string possibleKey = argv[i + 1];
                     if (!possibleKey.empty() && possibleKey[0] != '-') {
                         baseMiniKey = possibleKey;
-                        globalIndex = extractIndexFromKey(baseMiniKey) + 1;
-                        cout << "[=]Resuming from provided key: " << baseMiniKey << "\n";
                         i++;
-                    } else {
-                        string lastKey = readLastNonEmptyLine("sequence_log.txt");
-                        if (!lastKey.empty()) {
-                            baseMiniKey = lastKey;
-                            globalIndex = extractIndexFromKey(baseMiniKey) + 1;
-                            cout << "[=]Resuming from last logged key in file: " << lastKey << "\n";
-                        }
-                    }
-                } else {
-                    string lastKey = readLastNonEmptyLine("sequence_log.txt");
-                    if (!lastKey.empty()) {
-                        baseMiniKey = lastKey;
-                        globalIndex = extractIndexFromKey(baseMiniKey) + 1;
-                        cout << "[=]Resuming from last logged key in file: " << lastKey << "\n";
                     }
                 }
             } else if (arg == "-t" || arg == "-core") {
@@ -665,12 +664,34 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
-    
+
+    // Handle sequence mode setup
+    if (sequenceMode) {
+        if (!baseMiniKey.empty()) {
+            if (baseMiniKey[0] != 'S' || baseMiniKey.length() != miniKeyLength) {
+                cerr << "[X]Error: Provided starting key must start with 'S' and have length " << miniKeyLength << "\n";
+                return 1;
+            }
+        } else {
+            string lastKey = readLastNonEmptyLine("sequence_log.txt");
+            if (!lastKey.empty()) {
+                if (lastKey[0] == 'S' && lastKey.length() == miniKeyLength) {
+                    baseMiniKey = lastKey;
+                } else {
+                    cerr << "[X]Warning: Invalid key in sequence_log.txt, starting from beginning\n";
+                    baseMiniKey = "S" + string(miniKeyLength - 1, 'A');
+                }
+            } else {
+                baseMiniKey = "S" + string(miniKeyLength - 1, 'A');
+            }
+        }
+        cout << "[=]Starting sequence from key: " << baseMiniKey << "\n";
+    }
+
     if (!targetFile.empty()) {
         targetBloom = new BloomFilter(BLOOM_SIZE, BLOOM_HASHES);
         loadTargetHashes(targetFile);
     }
-    
     savedFile.open("saved.txt", ios::app);
     if (!savedFile) {
         cerr << "[X]Error opening saved.txt for writing.\n";
@@ -689,18 +710,36 @@ int main(int argc, char* argv[]) {
         foundFile.close();
         return 1;
     }
-    
+
     vector<thread> threads;
-    for (int i = 0; i < numThreads; i++)
-        threads.emplace_back(generationThread);
-    
+    if (sequenceMode) {
+        vector<string> startingKeys;
+        string current = baseMiniKey;
+        for (int i = 0; i < numThreads; i++) {
+            startingKeys.push_back(current);
+            try {
+                current = nextMiniKey(current);
+            } catch (const runtime_error& e) {
+                cerr << "[X]Error initializing thread keys: " << e.what() << "\n";
+                return 1;
+            }
+        }
+        for (int i = 0; i < numThreads; i++) {
+            threads.emplace_back(generationThread, startingKeys[i]);
+        }
+    } else {
+        for (int i = 0; i < numThreads; i++) {
+            threads.emplace_back(generationThread, "");
+        }
+    }
+
     thread performanceThread;
     if (printInterval > 0) {
         performanceThread = thread([&]() {
-            static steady_clock::time_point lastPrintTime = startTime; // Added: Track last print time
-            static long long prevKeyCounter = 0;                       // Added: Previous total keys
-            static long long prevValidKeyCounter = 0;                  // Added: Previous valid keys
-            static long long prevInvalidKeyCounter = 0;                // Added: Previous invalid keys
+            static steady_clock::time_point lastPrintTime = startTime;
+            static long long prevKeyCounter = 0;
+            static long long prevValidKeyCounter = 0;
+            static long long prevInvalidKeyCounter = 0;
             while (!shutdownFlag.load()) {
                 this_thread::sleep_for(seconds(printInterval));
                 auto now = steady_clock::now();
@@ -726,26 +765,24 @@ int main(int argc, char* argv[]) {
             }
         });
     }
-    
+
     for (auto &t : threads) {
         if (t.joinable())
             t.join();
     }
     if (performanceThread.joinable())
         performanceThread.join();
-    
+
     cout << "[X]Shutting down gracefully.\n";
-    
+
     if (targetBloom) {
         delete targetBloom;
         targetBloom = nullptr;
     }
-    
+
     savedFile.close();
     foundFile.close();
     sequenceLogFile.close();
-    
+
     return 0;
 }
-
-
